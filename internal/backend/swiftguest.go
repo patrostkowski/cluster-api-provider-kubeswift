@@ -289,10 +289,12 @@ func renderSwiftGuest(req Request, cfg *infrav1.SwiftGuestBackend) *unstructured
 	}
 	switch {
 	case cfg.NetworkRef != "":
-		// The named network is the guest's PRIMARY interface.
+		// The named network is the guest's PRIMARY interface. KubeSwift hands the NAD's
+		// IP and gateway to the guest only when primary is set explicitly.
 		spec["interfaces"] = []interface{}{
 			map[string]interface{}{
 				nameField:    "primary",
+				"primary":    true,
 				"networkRef": localRef(cfg.NetworkRef),
 			},
 		}
