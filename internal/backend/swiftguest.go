@@ -91,6 +91,46 @@ func validateGPU(gpu *infrav1.SwiftGuestGPU) error {
 	return nil
 }
 
+// validateInterfaces enforces the explicit interface list's shape. KubeSwift only
+// serves a NAD's IP and gateway on the primary interface, and a secondary without a
+// networkRef has nothing to bridge, so both mistakes yield a guest without a network.
+func validateInterfaces(cfg *infrav1.SwiftGuestBackend) error {
+	if len(cfg.Interfaces) == 0 {
+		return nil
+	}
+	if cfg.NetworkRef != "" || cfg.NodeNetworkRef != "" {
+		return fmt.Errorf("spec.backend.swiftGuest: interfaces cannot be combined with networkRef or nodeNetworkRef")
+	}
+	primaries := 0
+	for i, iface := range cfg.Interfaces {
+		if iface.Primary {
+			primaries++
+			continue
+		}
+		if iface.NetworkRef == "" {
+			return fmt.Errorf("spec.backend.swiftGuest.interfaces[%d] %q: a secondary interface must set networkRef", i, iface.Name)
+		}
+	}
+	if primaries != 1 {
+		return fmt.Errorf("spec.backend.swiftGuest.interfaces: exactly one interface must be primary, got %d", primaries)
+	}
+	return nil
+}
+
+// primaryOnNAD reports whether the guest's primary interface rides a NAD rather
+// than the node-local network.
+func primaryOnNAD(cfg *infrav1.SwiftGuestBackend) bool {
+	if cfg.NetworkRef != "" {
+		return true
+	}
+	for _, iface := range cfg.Interfaces {
+		if iface.Primary {
+			return iface.NetworkRef != ""
+		}
+	}
+	return false
+}
+
 // Reconcile ensures the SwiftSeedProfile + SwiftGuest exist and reports the VM state.
 func (b *SwiftGuestBackend) Reconcile(ctx context.Context, req Request) (Result, error) {
 	cfg := req.Machine.Spec.Backend.SwiftGuest
@@ -106,10 +146,13 @@ func (b *SwiftGuestBackend) Reconcile(ctx context.Context, req Request) (Result,
 	if err := validatePlacement(cfg); err != nil {
 		return Result{}, err
 	}
-	if req.ControlPlaneExposure != nil && cfg.NetworkRef != "" {
+	if err := validateInterfaces(cfg); err != nil {
+		return Result{}, err
+	}
+	if req.ControlPlaneExposure != nil && primaryOnNAD(cfg) {
 		// Service-backed endpoint provisioning exposes the API server over the pod
-		// network (nat binding); a bridge/NAD networkRef is incompatible with it.
-		return Result{}, fmt.Errorf("control-plane machine using Service-backed endpoint provisioning must not set spec.backend.swiftGuest.networkRef")
+		// network (nat binding); a primary on a bridge/NAD is incompatible with it.
+		return Result{}, fmt.Errorf("control-plane machine using Service-backed endpoint provisioning must not put its primary interface on a networkRef")
 	}
 
 	if err := b.ensureSeedProfile(ctx, req); err != nil {
@@ -288,6 +331,8 @@ func renderSwiftGuest(req Request, cfg *infrav1.SwiftGuestBackend) *unstructured
 		"seedProfileRef": localRef(seedName(req.Machine.Name)),
 	}
 	switch {
+	case len(cfg.Interfaces) > 0:
+		spec["interfaces"] = renderInterfaces(cfg.Interfaces)
 	case cfg.NetworkRef != "":
 		// The named network is the guest's PRIMARY interface. KubeSwift hands the NAD's
 		// IP and gateway to the guest only when primary is set explicitly.
@@ -381,6 +426,22 @@ func renderSwiftGuest(req Request, cfg *infrav1.SwiftGuestBackend) *unstructured
 	}
 	guest.Object["spec"] = spec
 	return guest
+}
+
+// renderInterfaces maps the explicit interface list onto SwiftGuest spec.interfaces.
+func renderInterfaces(ifaces []infrav1.SwiftGuestInterface) []interface{} {
+	out := make([]interface{}, 0, len(ifaces))
+	for _, iface := range ifaces {
+		m := map[string]interface{}{nameField: iface.Name}
+		if iface.Primary {
+			m["primary"] = true
+		}
+		if iface.NetworkRef != "" {
+			m["networkRef"] = localRef(iface.NetworkRef)
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 // nameField is the "name" key used throughout the unstructured SwiftGuest spec.

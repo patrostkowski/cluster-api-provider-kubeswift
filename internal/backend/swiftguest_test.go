@@ -99,6 +99,128 @@ func TestRenderSwiftGuest_NetworkRefIsPrimary(t *testing.T) {
 	}
 }
 
+// TestRenderSwiftGuest_Interfaces verifies the explicit list passes through in order,
+// with primary only on the primary and networkRef only where set.
+func TestRenderSwiftGuest_Interfaces(t *testing.T) {
+	req, cfg := testRenderRequest(nil, "")
+	cfg.Interfaces = []infrav1.SwiftGuestInterface{
+		{Name: "mgmt", Primary: true, NetworkRef: "mgmt-net"},
+		{Name: "storage", NetworkRef: "storage-net"},
+		{Name: "provider", NetworkRef: "provider-trunk"},
+	}
+	g := renderSwiftGuest(req, cfg)
+
+	ifaces, _, _ := unstructured.NestedSlice(g.Object, "spec", "interfaces")
+	if len(ifaces) != 3 {
+		t.Fatalf("want 3 interfaces, got %d", len(ifaces))
+	}
+	for i, want := range cfg.Interfaces {
+		got, _ := ifaces[i].(map[string]interface{})
+		if got[nameField] != want.Name {
+			t.Fatalf("interfaces[%d] name = %v, want %s", i, got[nameField], want.Name)
+		}
+		ref, _ := got["networkRef"].(map[string]interface{})
+		if ref["name"] != want.NetworkRef {
+			t.Fatalf("interfaces[%d] networkRef = %v, want %s", i, ref["name"], want.NetworkRef)
+		}
+		if _, hasPrimary := got["primary"]; hasPrimary != want.Primary {
+			t.Fatalf("interfaces[%d] primary set = %v, want %v", i, hasPrimary, want.Primary)
+		}
+	}
+}
+
+func TestValidateInterfaces(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     infrav1.SwiftGuestBackend
+		wantErr bool
+	}{
+		{name: "none", cfg: infrav1.SwiftGuestBackend{}},
+		{
+			name: "primary on NAD with secondaries",
+			cfg: infrav1.SwiftGuestBackend{Interfaces: []infrav1.SwiftGuestInterface{
+				{Name: "mgmt", Primary: true, NetworkRef: "mgmt-net"},
+				{Name: "storage", NetworkRef: "storage-net"},
+			}},
+		},
+		{
+			name: "node-local primary with secondary",
+			cfg: infrav1.SwiftGuestBackend{Interfaces: []infrav1.SwiftGuestInterface{
+				{Name: "mgmt", Primary: true},
+				{Name: "node", NetworkRef: "node-net"},
+			}},
+		},
+		{
+			name: "combined with networkRef",
+			cfg: infrav1.SwiftGuestBackend{NetworkRef: "nad", Interfaces: []infrav1.SwiftGuestInterface{
+				{Name: "mgmt", Primary: true, NetworkRef: "mgmt-net"},
+			}},
+			wantErr: true,
+		},
+		{
+			name: "combined with nodeNetworkRef",
+			cfg: infrav1.SwiftGuestBackend{NodeNetworkRef: "nad", Interfaces: []infrav1.SwiftGuestInterface{
+				{Name: "mgmt", Primary: true, NetworkRef: "mgmt-net"},
+			}},
+			wantErr: true,
+		},
+		{
+			name: "no primary",
+			cfg: infrav1.SwiftGuestBackend{Interfaces: []infrav1.SwiftGuestInterface{
+				{Name: "mgmt", NetworkRef: "mgmt-net"},
+			}},
+			wantErr: true,
+		},
+		{
+			name: "two primaries",
+			cfg: infrav1.SwiftGuestBackend{Interfaces: []infrav1.SwiftGuestInterface{
+				{Name: "mgmt", Primary: true, NetworkRef: "mgmt-net"},
+				{Name: "storage", Primary: true, NetworkRef: "storage-net"},
+			}},
+			wantErr: true,
+		},
+		{
+			name: "secondary without networkRef",
+			cfg: infrav1.SwiftGuestBackend{Interfaces: []infrav1.SwiftGuestInterface{
+				{Name: "mgmt", Primary: true, NetworkRef: "mgmt-net"},
+				{Name: "storage"},
+			}},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateInterfaces(&tt.cfg); (err != nil) != tt.wantErr {
+				t.Fatalf("validateInterfaces() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestReconcile_ExposureWithPrimaryInterfaceOnNADIsRejected checks the Service-backed
+// endpoint guard also covers a NAD primary declared through interfaces.
+func TestReconcile_ExposureWithPrimaryInterfaceOnNADIsRejected(t *testing.T) {
+	b := &SwiftGuestBackend{}
+	req := Request{
+		Machine: &infrav1.KubeSwiftMachine{
+			ObjectMeta: metav1.ObjectMeta{Name: "cp-0", Namespace: "ns"},
+			Spec: infrav1.KubeSwiftMachineSpec{
+				Backend: infrav1.MachineBackend{
+					Type: infrav1.SwiftGuestBackendType,
+					SwiftGuest: &infrav1.SwiftGuestBackend{ImageRef: "img", GuestClassRef: "class", Interfaces: []infrav1.SwiftGuestInterface{
+						{Name: "mgmt", Primary: true, NetworkRef: "mgmt-net"},
+					}},
+				},
+			},
+		},
+		ControlPlaneExposure: &ControlPlaneExposure{PoolLabel: "demo-cp", Port: 6443},
+		GuestNamespace:       "ns",
+	}
+	if _, err := b.Reconcile(context.Background(), req); err == nil {
+		t.Fatal("expected an error when control-plane exposure is combined with a primary interface on a networkRef")
+	}
+}
+
 // TestRenderSwiftGuest_NodeNetworkRef verifies the multi-node shape: a nat primary
 // (management + the reachable endpoint) plus a secondary routable node-datapath
 // interface, composing with the Service-backed nat endpoint (no rejection).
